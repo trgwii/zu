@@ -61,6 +61,7 @@ const Zig = struct {
         var req = try client.request(url, .{}, .{
             .header_strategy = .{ .static = try arena.alloc(u8, 16 * 1024) },
         });
+        defer req.deinit();
         var buf: [64 * 1024]u8 = undefined;
         var end = try req.readAll(&buf);
         const body = buf[0..end];
@@ -80,10 +81,10 @@ const Zig = struct {
         const versionEscaped2 = try std.mem.replaceOwned(u8, arena, versionEscaped, "-", "\\-");
         const formatted = try std.fmt.allocPrint(
             arena,
-            "New+Zig+version:+[{s}](https://ziglang.org/download/)\\+[{s}](https://github.com/ziglang/zig/commits/{s})",
+            "[{s}](https://ziglang.org/download/)\\+[{s}](https://github.com/ziglang/zig/commits/{s})",
             .{ versionEscaped2, commit, commit },
         );
-        const escaped = try std.Uri.escapeString(arena, formatted);
+        const escaped = try std.fmt.allocPrint(arena, "New+Zig+version:+{s}", .{try std.Uri.escapeString(arena, formatted)});
         return escaped;
     }
 };
@@ -91,14 +92,16 @@ const Zig = struct {
 const Telegram = struct {
     fn sendMessage(client: *std.http.Client, arena: std.mem.Allocator, token: []const u8, chat_id: []const u8, encoded_markdown_text: []const u8) ![]const u8 {
         var conn = try client.connect("api.telegram.org", 443, .tls);
-        try conn.writeAll("GET /bot");
-        try conn.writeAll(token);
-        try conn.writeAll("sendMessage?chat_id=");
-        try conn.writeAll(chat_id);
-        try conn.writeAll("&text=");
-        try conn.writeAll(encoded_markdown_text);
-        try conn.writeAll(
-            \\&parse_mode=MarkdownV2 HTTP/1.1
+        const r = conn.data.reader();
+        const w = conn.data.writer();
+        try w.writeAll("GET /bot");
+        try w.writeAll(token);
+        try w.writeAll("/sendMessage?chat_id=");
+        try w.writeAll(chat_id);
+        try w.writeAll("&text=");
+        try w.writeAll(encoded_markdown_text);
+        try w.writeAll(
+            \\&parse_mode=MarkdownV2&disable_web_page_preview=1 HTTP/1.1
             \\Host: api.telegram.org
             \\Connection: close
             \\
@@ -106,8 +109,8 @@ const Telegram = struct {
         );
         var buf = try arena.alloc(u8, 4 * 1024);
         var total_bytes_read: usize = 0;
-        var bytes_read = try conn.read(buf[total_bytes_read..]);
-        while (bytes_read > 0) : (bytes_read = try conn.read(buf[total_bytes_read..])) {
+        var bytes_read = try r.read(buf[total_bytes_read..]);
+        while (bytes_read > 0) : (bytes_read = try r.read(buf[total_bytes_read..])) {
             total_bytes_read += bytes_read;
         }
         const response = buf[0..total_bytes_read];
@@ -118,13 +121,26 @@ const Telegram = struct {
 };
 
 pub fn main() !void {
-    var gpa = Mem.initGPA(512 * 1024);
+    var gpa = Mem.initGPA(10 * 1024 * 1024);
     defer std.debug.assert(!gpa.deinit());
     const permanent = gpa.allocator();
 
-    var tmpMem: [32 * 1024]u8 = undefined;
-    var tmpFba = std.heap.FixedBufferAllocator.init(&tmpMem);
+    var tmpMem = try permanent.alloc(u8, 1 * 1024 * 1024);
+    defer permanent.free(tmpMem);
+    var tmpFba = std.heap.FixedBufferAllocator.init(tmpMem);
     const arena = tmpFba.allocator();
+
+    const chats_file = try std.fs.cwd().readFileAlloc(permanent, "chats.txt", 5 * 1024 * 1024);
+    defer permanent.free(chats_file);
+
+    var chats = std.ArrayList([]const u8).init(permanent);
+    defer chats.deinit();
+
+    var it = std.mem.split(u8, chats_file, "\n");
+    while (it.next()) |chat| {
+        if (chat.len == 0) continue;
+        try chats.append(chat);
+    }
 
     const args = try std.process.argsAlloc(permanent);
     defer std.process.argsFree(permanent, args);
@@ -139,28 +155,29 @@ pub fn main() !void {
     var current_version = try std.fs.cwd().readFileAlloc(permanent, "zig_version.txt", 1024);
     defer permanent.free(current_version);
 
-    if (args.len >= 4 and std.mem.eql(u8, args[1], "bot")) {
+    if (args.len >= 3 and std.mem.eql(u8, args[1], "bot")) {
         while (true) : (tmpFba.reset()) {
             defer std.time.sleep(std.time.ns_per_s * 300);
 
             Mem.usedMem(.{
-                .global = .{ gpa.total_requested_bytes, gpa.requested_memory_limit },
+                .permanent = .{ gpa.total_requested_bytes, gpa.requested_memory_limit },
                 .arena = .{ tmpFba.end_index, tmpFba.buffer.len },
             });
             defer Mem.usedMem(.{
-                .global = .{ gpa.total_requested_bytes, gpa.requested_memory_limit },
+                .permanent = .{ gpa.total_requested_bytes, gpa.requested_memory_limit },
                 .arena = .{ tmpFba.end_index, tmpFba.buffer.len },
             });
 
-            const fetched_version = Zig.fetchZigVersion(&client, arena) catch continue;
+            const fetched_version = try Zig.fetchZigVersion(&client, arena);
 
             if (!std.mem.eql(u8, fetched_version, current_version)) {
                 permanent.free(current_version);
                 current_version = try permanent.dupe(u8, fetched_version);
                 const escaped = try Zig.buildMarkdownString(arena, fetched_version);
                 const token = args[2];
-                for (0..args.len - 4) |i| {
-                    const chat_id = args[3 + i];
+                const restorePoint = tmpFba.end_index;
+                for (chats.items) |chat_id| {
+                    defer tmpFba.end_index = restorePoint;
                     const body = Telegram.sendMessage(&client, arena, token, chat_id, escaped) catch |err| {
                         std.debug.print("Error while sending to {s}: {}\n", .{ chat_id, err });
                         continue;
